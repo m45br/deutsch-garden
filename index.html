@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Deutsch Garden — Learn German (Canvas)</title>
+  <style>
+    :root{
+      --bg:#0b0f1a; --ink:#eaf2ff; --muted:#9db2d0; --accent:#6ee7ff; --accent2:#a78bfa; --good:#8affb3; --bad:#ff788a; --warn:#ffd166;
+    }
+    html, body { height:100%; }
+    body { margin:0; background:var(--bg); color:var(--ink); overflow:hidden; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; }
+    #app { display:block; width:100vw; height:100vh; outline:none; }
+    /* Prevent selection during drag */
+    * { user-select:none; -webkit-user-select:none; -ms-user-select:none; }
+  </style>
+</head>
+<body>
+  <canvas id="app" tabindex="0" aria-label="Deutsch Garden app"></canvas>
+  <script>
+  /* =============================================================
+   * Deutsch Garden — A single-file, dependency-free Canvas app
+   * Activities: Flashcards, Quiz, Mouse-&-Cheese (Snake variant)
+   * Progress: LocalStorage daily tracking & streaks
+   * Voice-over: Web Speech API (speechSynthesis) — no external audio
+   * Everything is rendered on <canvas>; no external libraries.
+   * ============================================================= */
+  (()=>{
+    const App = {
+      canvas: document.getElementById('app'),
+      ctx: null,
+      w: 1280,
+      h: 720,
+      dpr: Math.min(window.devicePixelRatio || 1, 2),
+      state: 'menu',
+      substate: null,
+      buttons: [],
+      now: performance.now(),
+      dt: 0,
+      last: performance.now(),
+      pointer: {x:0,y:0,down:false,justUp:false},
+      keys: new Set(),
+      themeHue: 210,
+      particles: [],
+      storageKey: 'deutsch-garden-v1',
+      progress: null,
+      settings: {
+        tts:true, speakEnglishHint:true, volume:1, rate:1, repeatShortcut:true,
+      },
+      wordBank: [],
+      rng: (min,max)=>Math.random()*(max-min)+min,
+      clamp:(v,a,b)=>Math.max(a,Math.min(b,v)),
+      lerp:(a,b,t)=>a+(b-a)*t,
+    };
+
+    // ========= Responsive canvas =========
+    function resize(){
+      const c = App.canvas, dpr = App.dpr;
+      App.w = Math.floor(window.innerWidth);
+      App.h = Math.floor(window.innerHeight);
+      c.width = Math.floor(App.w * dpr);
+      c.height = Math.floor(App.h * dpr);
+      c.style.width = App.w + 'px';
+      c.style.height = App.h + 'px';
+      App.ctx.setTransform(dpr,0,0,dpr,0,0);
+    }
+
+    // ========= Drawing helpers =========
+    const ctx = ()=>App.ctx;
+    function roundRect(x,y,w,h,r){
+      const c = ctx();
+      const rr = Math.min(r, w/2, h/2);
+      c.beginPath();
+      c.moveTo(x+rr,y);
+      c.arcTo(x+w,y,x+w,y+h,rr);
+      c.arcTo(x+w,y+h,x,y+h,rr);
+      c.arcTo(x,y+h,x,y,rr);
+      c.arcTo(x,y,x+w,y,rr);
+      c.closePath();
+    }
+    function shadow(f, blur=24, color='rgba(0,0,0,0.35)', ox=0, oy=6){
+      const c = ctx(), prev = [c.shadowBlur,c.shadowColor,c.shadowOffsetX,c.shadowOffsetY];
+      c.shadowBlur = blur; c.shadowColor=color; c.shadowOffsetX=ox; c.shadowOffsetY=oy;
+      f();
+      [c.shadowBlur,c.shadowColor,c.shadowOffsetX,c.shadowOffsetY] = prev;
+    }
+    function button(x,y,w,h,label, onClick, opts={}){
+      const {icon=null, hotkey=null, theme='primary', disabled=false} = opts;
+      const hovered = hit(x,y,w,h);
+      const pad = 14;
+      const rad = 14;
+      const c = ctx();
+      const palette = theme==='danger' ? ['#ff4d68','#e43651'] : theme==='ghost'? ['#1a2438','#151d2e'] : ['#3b82f6','#2563eb'];
+      const grad = c.createLinearGradient(x,y,x,y+h);
+      grad.addColorStop(0, palette[0]);
+      grad.addColorStop(1, palette[1]);
+      c.globalAlpha = disabled?0.6:1;
+      shadow(()=>{ c.fillStyle = hovered && !disabled ? grad : (theme==='ghost'? '#0f172a' : '#1f2a44'); roundRect(x,y,w,h,rad); c.fill(); }, 18, 'rgba(0,0,0,0.35)', 0, 6);
+      c.save();
+      c.clip();
+      if(!disabled && theme!=='ghost'){
+        c.fillStyle = hovered? grad : 'rgba(255,255,255,0.04)'; roundRect(x,y,w,h,rad); c.fill();
+      }
+      c.restore();
+      c.fillStyle = disabled? '#6b7280' : '#eaf2ff';
+      c.font = '700 18px ui-sans-serif, system-ui';
+      c.textAlign='center'; c.textBaseline='middle';
+      c.fillText(label + (hotkey?`  [${hotkey}]`:''), x+w/2, y+h/2);
+      App.buttons.push({x,y,w,h, onClick, disabled});
+    }
+    function tag(x,y,text,color){
+      const c = ctx();
+      c.font = '600 14px ui-sans-serif, system-ui';
+      const w = c.measureText(text).width + 16;
+      const h = 26;
+      c.fillStyle = color; roundRect(x,y,w,h,12); c.fill();
+      c.fillStyle = '#0b0f1a'; c.textAlign='left'; c.textBaseline='middle';
+      c.fillText(text, x+8, y+h/2);
+      return {w,h};
+    }
+    function hit(x,y,w,h){
+      const p = App.pointer; return (p.x>=x && p.x<=x+w && p.y>=y && p.y<=y+h);
+    }
+
+    // ========= Fancy background =========
+    function drawBackground(){
+      const c = ctx();
+      const t = App.now * 0.0002;
+      const hue = (App.themeHue + Math.sin(t*40)*4) % 360;
+      const g = c.createLinearGradient(0,0,App.w,App.h);
+      g.addColorStop(0, `hsl(${hue}, 40%, 12%)`);
+      g.addColorStop(1, `hsl(${(hue+60)%360}, 50%, 10%)`);
+      c.fillStyle = g; c.fillRect(0,0,App.w,App.h);
+      // floating orbs
+      if (!App.particles.length){
+        for (let i=0;i<60;i++) App.particles.push({x:Math.random()*App.w, y:Math.random()*App.h, r: App.rng(10,50), spx: App.rng(-0.2,0.2), spy: App.rng(-0.2,0.2), a: App.rng(0.03,0.1)});
+      }
+      c.globalCompositeOperation = 'lighter';
+      for (const p of App.particles){ p.x+=p.spx; p.y+=p.spy; if (p.x<-60) p.x=App.w+60; if (p.x>App.w+60) p.x=-60; if (p.y<-60) p.y=App.h+60; if (p.y>App.h+60) p.y=-60; c.fillStyle = `hsla(${hue+ (p.r%80)}, 70%, ${40 + (p.r%20)}%, 0.06)`; c.beginPath(); c.arc(p.x, p.y, p.r*(1+Math.sin(App.now*p.a)*0.03), 0, Math.PI*2); c.fill(); }
+      c.globalCompositeOperation = 'source-over';
+    }
+
+    // ========= Word Bank =========
+    const WB = [
+      ['Apfel','apple'],['Brot','bread'],['Wasser','water'],['Milch','milk'],['Kaffee','coffee'],['Tee','tea'],['Käse','cheese'],['Ei','egg'],['Fisch','fish'],['Fleisch','meat'],
+      ['Haus','house'],['Zimmer','room'],['Fenster','window'],['Tür','door'],['Stuhl','chair'],['Tisch','table'],['Bett','bed'],['Lampe','lamp'],['Schlüssel','key'],['Buch','book'],
+      ['Hund','dog'],['Katze','cat'],['Vogel','bird'],['Pferd','horse'],['Kuh','cow'],['Schwein','pig'],['Hase','rabbit'],['Maus','mouse'],['Bär','bear'],['Löwe','lion'],
+      ['rot','red'],['blau','blue'],['grün','green'],['gelb','yellow'],['schwarz','black'],['weiß','white'],['braun','brown'],['grau','gray'],['orange','orange'],['rosa','pink'],
+      ['eins','one'],['zwei','two'],['drei','three'],['vier','four'],['fünf','five'],['sechs','six'],['sieben','seven'],['acht','eight'],['neun','nine'],['zehn','ten'],
+      ['Hallo','hello'],['Tschüss','bye'],['Bitte','please'],['Danke','thank you'],['Ja','yes'],['Nein','no'],['Entschuldigung','sorry'],['Guten Morgen','good morning'],
+      ['Guten Abend','good evening'],['Gute Nacht','good night'],['Freund','friend'],['Familie','family'],['Schule','school'],['Arbeit','work'],['Stadt','city'],['Land','country'],
+      ['Straße','street'],['Auto','car'],['Zug','train'],['Flugzeug','airplane'],['Fahrrad','bicycle'],['laufen','to run'],['gehen','to go'],['sprechen','to speak'],['lesen','to read'],['schreiben','to write'],['lernen','to learn'],['spielen','to play'],['essen','to eat'],['trinken','to drink'],['sehen','to see'],['hören','to hear']
+    ];
+
+    // Shuffle helper
+    function shuffled(arr){ const a = arr.slice(); for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; }
+
+    // ========= Storage & Progress =========
+    function todayStr(){ const d = new Date(); const y=d.getFullYear(); const m=(d.getMonth()+1).toString().padStart(2,'0'); const da=d.getDate().toString().padStart(2,'0'); return `${y}-${m}-${da}`; }
+    function loadProgress(){
+      try{ const raw = localStorage.getItem(App.storageKey); if (raw){ const o = JSON.parse(raw); App.settings = Object.assign(App.settings, o.settings||{}); return o; } }catch(e){}
+      return { days:{}, settings: App.settings };
+    }
+    function saveProgress(){ try{ localStorage.setItem(App.storageKey, JSON.stringify(App.progress)); }catch(e){}
+    }
+    function ensureDay(){ const t = todayStr(); if (!App.progress.days[t]) App.progress.days[t] = { flashcards:0, quiz:{correct:0,total:0}, cheese:0, wordsLearned:[], lastActive: Date.now() }; }
+    function addWordLearned(w){ ensureDay(); const d = App.progress.days[todayStr()]; if (!d.wordsLearned.includes(w)) d.wordsLearned.push(w); d.lastActive=Date.now(); saveProgress(); }
+    function inc(path){ ensureDay(); const d = App.progress.days[todayStr()]; if (path==='flashcards'){ d.flashcards++; } else if (path==='cheese'){ d.cheese++; } d.lastActive=Date.now(); saveProgress(); }
+    function quizTrack(correct){ ensureDay(); const d = App.progress.days[todayStr()]; d.quiz.total++; if (correct) d.quiz.correct++; d.lastActive=Date.now(); saveProgress(); }
+    function computeStreak(){ const keys = Object.keys(App.progress.days).sort(); if (!keys.length) return 0; let streak=0; let prev=null; for (let i=keys.length-1;i>=0;i--){ const k = keys[i]; if (!prev){ streak=1; prev=k; continue; } const a = new Date(prev); const b = new Date(k); const diff = Math.round((a - b)/86400000); if (diff===1){ streak++; prev=k; } else if (diff===0){ continue; } else break; } return streak; }
+
+    // ========= TTS =========
+    function speak(text, lang='de-DE'){
+      if (!App.settings.tts) return;
+      if (!('speechSynthesis' in window)) return;
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = lang;
+      u.rate = App.settings.rate || 1;
+      u.volume = App.settings.volume || 1;
+      try { window.speechSynthesis.cancel(); } catch(e){}
+      window.speechSynthesis.speak(u);
+    }
+    function speakWord(de, en){
+      if (!App.settings.tts) return;
+      // Say German, optional English hint, then repeat German cue
+      const seq = [];
+      seq.push({text: de, lang:'de-DE'});
+      if (App.settings.speakEnglishHint) seq.push({text: `${de}. It means ${en}.`, lang:'en-US'});
+      seq.push({text: `Sprich nach: ${de}`, lang:'de-DE'});
+      function playNext(){
+        const part = seq.shift(); if (!part) return;
+        const u = new SpeechSynthesisUtterance(part.text);
+        u.lang = part.lang; u.rate = App.settings.rate; u.volume = App.settings.volume;
+        u.onend = ()=> playNext();
+        try { window.speechSynthesis.speak(u); } catch(e){}
+      }
+      try { window.speechSynthesis.cancel(); } catch(e){}
+      playNext();
+    }
+
+    // ========= App screens =========
+    const Screens = {
+      menu: {
+        draw(){
+          drawBackground();
+          const c = ctx();
+          const title = 'Deutsch Garden';
+          c.fillStyle = '#eaf2ff';
+          c.textAlign='center'; c.textBaseline='top';
+          c.font = '900 48px ui-sans-serif, system-ui';
+          c.fillText(title, App.w/2, 48);
+          c.font = '500 18px ui-sans-serif, system-ui';
+          c.fillStyle = '#9db2d0';
+          c.fillText('A playful, all-canvas German learning app', App.w/2, 104);
+
+          // Big cards for modes
+          const W = Math.min(360, App.w*0.8);
+          const H = 84; const gap = 18; let y = 160; const x = App.w/2 - W/2;
+
+          button(x,y,W,H,'Flashcards', ()=> setState('flash')); y+=H+gap;
+          button(x,y,W,H,'Quiz (Multiple Choice)', ()=> setState('quiz')); y+=H+gap;
+          button(x,y,W,H,'Mouse & Cheese — Game', ()=> setState('snake')); y+=H+gap;
+          button(x,y,W,H,'Progress & Streaks', ()=> setState('progress'), {theme:'ghost'}); y+=H+gap;
+          button(x,y,W,H,'Settings', ()=> setState('settings'), {theme:'ghost'});
+
+          // Footer tips
+          c.textAlign='center'; c.textBaseline='bottom'; c.font='500 14px ui-sans-serif, system-ui';
+          c.fillStyle='#9db2d0';
+          c.fillText('Tip: Your progress is saved locally on this device (no sign-in needed).', App.w/2, App.h-24);
+        },
+        keydown(e){ if (e.key==='1') setState('flash'); if (e.key==='2') setState('quiz'); if (e.key==='3') setState('snake'); if (e.key==='4') setState('progress'); if (e.key==='5') setState('settings'); }
+      },
+      settings: {
+        draw(){
+          drawBackground();
+          const c = ctx();
+          c.textAlign='left'; c.textBaseline='top';
+          c.fillStyle='#eaf2ff'; c.font='900 38px ui-sans-serif, system-ui';
+          c.fillText('Settings', 40, 40);
+          c.font='500 18px ui-sans-serif, system-ui'; c.fillStyle='#9db2d0';
+          c.fillText('Fine-tune voice, accessibility, and visuals.', 40, 84);
+
+          const bx=40, by=140, bw=Math.min(560, App.w-80), bh=60, g=16; let y=by;
+          const s = App.settings;
+          button(bx,y,bw,bh,`Voice-over: ${s.tts? 'On':'Off'}`, ()=>{ s.tts=!s.tts; App.progress.settings = s; saveProgress(); }, {theme: s.tts?'primary':'danger'}); y+=bh+g;
+          button(bx,y,bw,bh,`English hint in voice: ${s.speakEnglishHint?'On':'Off'}`, ()=>{ s.speakEnglishHint=!s.speakEnglishHint; App.progress.settings = s; saveProgress(); }, {theme: s.speakEnglishHint?'primary':'ghost'}); y+=bh+g;
+          button(bx,y,bw,bh,`Voice rate: ${s.rate.toFixed(2)}  (- / +)`, ()=>{}, {disabled:true, theme:'ghost'}); y+=bh+g;
+          button(bx,y,bw*0.48,bh,'Rate -', ()=>{ s.rate = App.clamp((s.rate||1)-0.1, 0.6, 1.4); App.progress.settings=s; saveProgress(); });
+          button(bx+bw*0.52,y-bh- g,bw*0.48,bh,'Rate +', ()=>{ s.rate = App.clamp((s.rate||1)+0.1, 0.6, 1.4); App.progress.settings=s; saveProgress(); }); y+=g+bh*0.1;
+
+          y+=10;
+          button(bx,y,bw,bh,'Back to menu  [Esc]', ()=> setState('menu'), {theme:'ghost'});
+        },
+        keydown(e){ if (e.key==='Escape') setState('menu'); if (e.key==='+') {App.settings.rate=App.clamp(App.settings.rate+0.1,0.6,1.4); saveProgress();} if (e.key==='-'){App.settings.rate=App.clamp(App.settings.rate-0.1,0.6,1.4); saveProgress();} }
+      },
+      progress: {
+        draw(){
+          drawBackground(); const c = ctx();
+          c.fillStyle='#eaf2ff'; c.textAlign='left'; c.textBaseline='top'; c.font='900 38px ui-sans-serif, system-ui';
+          c.fillText('Progress & Streaks', 40, 40);
+          const days = App.progress.days; const keys = Object.keys(days).sort();
+          const streak = computeStreak();
+          const totalWords = [...new Set(keys.flatMap(k=>days[k].wordsLearned))].length;
+          const totalQuiz = keys.reduce((s,k)=> s+days[k].quiz.total,0);
+          const correctQuiz = keys.reduce((s,k)=> s+days[k].quiz.correct,0);
+          const cheese = keys.reduce((s,k)=> s+days[k].cheese,0);
+          const flash = keys.reduce((s,k)=> s+days[k].flashcards,0);
+
+          const bx=40, by=100, bw=Math.min(560, App.w-80), bh=60, g=16; let y=by;
+          tag(bx, y-32, `Today: ${todayStr()}`, 'rgba(255,255,255,0.08)');
+          button(bx,y,bw,bh,`Current streak: ${streak} day${streak===1?'':'s'}`, ()=>{}, {disabled:true, theme:'ghost'}); y+=bh+g;
+          button(bx,y,bw,bh,`Unique words learned: ${totalWords}`, ()=>{}, {disabled:true, theme:'ghost'}); y+=bh+g;
+          button(bx,y,bw,bh,`Quiz accuracy: ${totalQuiz?Math.round(correctQuiz/totalQuiz*100):0}%  (${correctQuiz}/${totalQuiz})`, ()=>{}, {disabled:true, theme:'ghost'}); y+=bh+g;
+          button(bx,y,bw,bh,`Cheese eaten in game: ${cheese}`, ()=>{}, {disabled:true, theme:'ghost'}); y+=bh+g;
+          button(bx,y,bw,bh,`Flashcards reviewed: ${flash}`, ()=>{}, {disabled:true, theme:'ghost'}); y+=bh+g;
+
+          button(bx,y,bw,bh,'Export progress (JSON)', ()=>{
+            const data = JSON.stringify(App.progress, null, 2);
+            const blob = new Blob([data], {type:'application/json'});
+            const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='deutsch-garden-progress.json'; a.click(); URL.revokeObjectURL(url);
+          }, {theme:'primary'}); y+=bh+g;
+
+          button(bx,y,bw,bh,'Reset progress (local device only)', ()=>{ if (confirm('This will clear your local progress. Continue?')){ localStorage.removeItem(App.storageKey); App.progress = loadProgress(); } }, {theme:'danger'}); y+=bh+g;
+
+          button(bx,y,bw,bh,'Back to menu  [Esc]', ()=> setState('menu'), {theme:'ghost'});
+
+          // Right side calendar-like dots
+          const startX = Math.min(App.w-420, App.w*0.5+60), startY = 140, cell=22;
+          c.font='600 14px ui-sans-serif, system-ui'; c.fillStyle='#9db2d0'; c.textAlign='left'; c.fillText('Activity heatmap (last 100 days):', startX, startY-28);
+          const recent = keys.slice(-100);
+          recent.forEach((k,i)=>{
+            const row = Math.floor(i/10), col = i%10; const x = startX + col*(cell+8), y2 = startY + row*(cell+8);
+            const d = days[k]; const score = (d.wordsLearned.length>0?1:0) + (d.quiz.total>0?1:0) + (d.cheese>0?1:0) + (d.flashcards>0?1:0);
+            const colors = ['#1f2937','#334155','#3b82f6','#22c55e','#f59e0b'];
+            const color = colors[Math.min(score, colors.length-1)];
+            ctx().fillStyle = color; roundRect(x,y2,cell,cell,6); ctx().fill();
+          });
+        },
+        keydown(e){ if (e.key==='Escape') setState('menu'); }
+      },
+      flash: {
+        idx:0, showFront:true, deck:[],
+        enter(){ this.deck = shuffled(App.wordBank); this.idx=0; this.showFront=true; },
+        draw(){
+          drawBackground(); const c = ctx();
+          c.fillStyle='#eaf2ff'; c.textAlign='left'; c.textBaseline='top'; c.font='900 38px ui-sans-serif, system-ui';
+          c.fillText('Flashcards', 40, 40);
+          c.font='500 16px ui-sans-serif, system-ui'; c.fillStyle='#9db2d0'; c.fillText('Space/Click: flip • ←/→: prev/next • S: speak • Esc: menu', 40, 84);
+
+          const cardW = Math.min(680, App.w-80), cardH = Math.min(380, App.h-240);
+          const x = App.w/2 - cardW/2, y = App.h/2 - cardH/2;
+          shadow(()=>{ ctx().fillStyle='#0f172a'; roundRect(x,y,cardW,cardH,24); ctx().fill(); }, 28, 'rgba(0,0,0,0.45)', 0, 18);
+
+          const pair = this.deck[this.idx%this.deck.length]; const [de,en] = pair;
+          c.textAlign='center'; c.textBaseline='middle';
+          if (this.showFront){ c.fillStyle='#eaf2ff'; c.font='800 64px ui-sans-serif, system-ui'; c.fillText(de, App.w/2, App.h/2);
+            c.font='500 16px ui-sans-serif, system-ui'; c.fillStyle='#9db2d0'; c.fillText('Front • German', App.w/2, y+cardH-28);
+          } else { c.fillStyle='#eaf2ff'; c.font='800 48px ui-sans-serif, system-ui'; c.fillText(en, App.w/2, App.h/2-12); c.font='700 28px ui-sans-serif, system-ui'; c.fillStyle='#a5b4fc'; c.fillText(de, App.w/2, App.h/2+44); c.font='500 16px ui-sans-serif, system-ui'; c.fillStyle='#9db2d0'; c.fillText('Back • English + German', App.w/2, y+cardH-28); }
+
+          // Navigation buttons
+          const W = Math.min(360, App.w-80); const H = 60; const gap = 16; let by = y+cardH+24; const bx = App.w/2 - W/2;
+          button(bx,by,W,H,'Prev  [←]', ()=>{ this.idx = (this.idx-1+this.deck.length)%this.deck.length; this.showFront=true; }); by+=H+gap;
+          button(bx,by,W,H, this.showFront?'Flip  [Space/Click]':'Speak & Mark Learned  [S]', ()=>{
+            if (this.showFront){ this.showFront=false; speakWord(de,en); } else { speakWord(de,en); addWordLearned(de); inc('flashcards'); }
+          }, {theme: this.showFront?'primary':'primary'}); by+=H+gap;
+          button(bx,by,W,H,'Next  [→]', ()=>{ this.idx = (this.idx+1)%this.deck.length; this.showFront=true; }); by+=H+gap;
+          button(bx,by,W,H,'Back to menu  [Esc]', ()=> setState('menu'), {theme:'ghost'});
+        },
+        keydown(e){ const pair = this.deck[this.idx%this.deck.length]; const [de,en] = pair;
+          if (e.key==='Escape') setState('menu');
+          if (e.key==='ArrowLeft'){ this.idx=(this.idx-1+this.deck.length)%this.deck.length; this.showFront=true; }
+          if (e.key==='ArrowRight'){ this.idx=(this.idx+1)%this.deck.length; this.showFront=true; }
+          if (e.key===' '){ if (this.showFront){ this.showFront=false; speakWord(de,en);} else { speakWord(de,en); addWordLearned(de); inc('flashcards'); } }
+          if (e.key.toLowerCase()==='s'){ speakWord(de,en); addWordLearned(de); inc('flashcards'); }
+        },
+        pointerdown(){ this.keydown({key:' '}); }
+      },
+      quiz: {
+        round:0, totalRounds:10, q:null, choices:[], direction:'de->en', score:0,
+        enter(){ this.round=0; this.score=0; this.nextQ(); },
+        nextQ(){
+          const pool = shuffled(App.wordBank); const pick = pool[0]; const [de,en]=pick;
+          this.direction = Math.random()<0.5 ? 'de->en' : 'en->de';
+          const correct = this.direction==='de->en'? en : de;
+          const wrong = pool.slice(1,8).map(p=> this.direction==='de->en'? p[1]:p[0]);
+          this.choices = shuffled([correct, ...shuffled(wrong).slice(0,3)]);
+          this.q = {de,en, correct}; this.round++;
+        },
+        draw(){
+          drawBackground(); const c = ctx();
+          c.fillStyle='#eaf2ff'; c.textAlign='left'; c.textBaseline='top'; c.font='900 38px ui-sans-serif, system-ui';
+          c.fillText('Quiz', 40, 40);
+          c.font='500 16px ui-sans-serif, system-ui'; c.fillStyle='#9db2d0'; c.fillText('Click an answer • 1-4: choose • R: repeat word • Esc: menu', 40, 84);
+
+          const q = this.q; if (!q) return;
+          const prompt = this.direction==='de->en' ? `What is the meaning of “${q.de}”?` : `What is the German for “${q.en}”?`;
+          c.font='800 28px ui-sans-serif, system-ui'; c.fillStyle='#eaf2ff'; c.fillText(prompt, 40, 140);
+
+          const bx=40, by=200, bw=Math.min(App.w-80, 720), bh=68, g=16; let y=by;
+          this.choices.forEach((choice, idx)=>{
+            button(bx,y,bw,bh, `${idx+1}. ${choice}`, ()=> this.choose(choice), {theme:'primary'}); y+=bh+g;
+          });
+
+          // Status right
+          const scoreTxt = `Round ${this.round}/${this.totalRounds} • Score ${this.score}`;
+          c.textAlign='right'; c.font='700 18px ui-sans-serif, system-ui'; c.fillStyle='#a5b4fc'; c.fillText(scoreTxt, App.w-40, 48);
+        },
+        choose(choice){
+          const correct = (choice===this.q.correct);
+          if (correct){ this.score++; speakWord(this.q.de, this.q.en); addWordLearned(this.q.de); }
+          quizTrack(correct);
+          if (this.round>=this.totalRounds){ setState('quizResult',{score:this.score,total:this.totalRounds}); }
+          else this.nextQ();
+        },
+        keydown(e){ if (e.key==='Escape') setState('menu'); if (['1','2','3','4'].includes(e.key)){ const i=parseInt(e.key)-1; this.choose(this.choices[i]); } if (e.key.toLowerCase()==='r'){ speakWord(this.q.de, this.q.en); }
+        }
+      },
+      quizResult: {
+        score:0,total:10,
+        enter(p){ this.score=p.score; this.total=p.total; },
+        draw(){ drawBackground(); const c = ctx();
+          c.textAlign='center'; c.textBaseline='middle';
+          c.font='900 56px ui-sans-serif, system-ui'; c.fillStyle = this.score/this.total>=0.6? '#8affb3':'#ffd166';
+          c.fillText(`Score: ${this.score}/${this.total}`, App.w/2, App.h/2 - 40);
+          c.font='600 20px ui-sans-serif, system-ui'; c.fillStyle='#9db2d0';
+          c.fillText('Press Enter to retry • Esc for menu', App.w/2, App.h/2+24);
+          const W=320,H=64; button(App.w/2-W/2, App.h/2+60, W,H,'Retry Quiz  [Enter]', ()=> setState('quiz'));
+          button(App.w/2-W/2, App.h/2+60+H+16, W,H,'Back to menu  [Esc]', ()=> setState('menu'), {theme:'ghost'});
+        },
+        keydown(e){ if (e.key==='Enter') setState('quiz'); if (e.key==='Escape') setState('menu'); }
+      },
+      snake: {
+        grid: {cols: 28, rows: 18, cell: 32},
+        stepMs: 120, acc:0, dir:{x:1,y:0}, nextDir:{x:1,y:0},
+        snake:[], cheese:{x:10,y:10}, paused:false, over:false, wordsRun:[],
+        enter(){
+          // Dynamic grid from screen size
+          const cell = Math.max(20, Math.min(Math.floor(App.w/32), Math.floor(App.h/22)));
+          this.grid.cell = cell; this.grid.cols = Math.floor(App.w/cell)-2; this.grid.rows = Math.floor((App.h-160)/cell)-2;
+          const cx = Math.floor(this.grid.cols/2), cy = Math.floor(this.grid.rows/2);
+          this.snake=[{x:cx,y:cy},{x:cx-1,y:cy},{x:cx-2,y:cy}];
+          this.dir={x:1,y:0}; this.nextDir={x:1,y:0}; this.placeCheese(); this.paused=false; this.over=false; this.wordsRun=[]; this.acc=0;
+        },
+        placeCheese(){
+          let x,y; do{ x=Math.floor(Math.random()*this.grid.cols); y=Math.floor(Math.random()*this.grid.rows); } while (this.snake.some(s=>s.x===x&&s.y===y));
+          this.cheese={x,y};
+        },
+        draw(){
+          drawBackground(); const c = ctx();
+          c.textAlign='left'; c.textBaseline='top';
+          c.fillStyle='#eaf2ff'; c.font='900 34px ui-sans-serif, system-ui'; c.fillText('Mouse & Cheese', 40, 28);
+          c.font='500 14px ui-sans-serif, system-ui'; c.fillStyle='#9db2d0'; c.fillText('Arrows to move • P: pause • R: repeat word • Esc: menu', 40, 68);
+
+          // Board frame
+          const cell=this.grid.cell, offX = Math.floor((App.w - this.grid.cols*cell)/2), offY = 110;
+          shadow(()=>{ c.fillStyle='#0b1325'; roundRect(offX-12, offY-12, this.grid.cols*cell+24, this.grid.rows*cell+24, 18); c.fill(); }, 24, 'rgba(0,0,0,0.45)', 0, 12);
+          // Tiles
+          for (let r=0;r<this.grid.rows;r++){
+            for (let k=0;k<this.grid.cols;k++){
+              const even = (r+k)%2===0; c.fillStyle = even? '#0f172a' : '#111b2e'; c.fillRect(offX+k*cell, offY+r*cell, cell, cell);
+            }
+          }
+          // Cheese
+          const chx = offX + this.cheese.x*cell + cell/2, chy = offY + this.cheese.y*cell + cell/2;
+          c.fillStyle='#ffd166';
+          c.beginPath(); c.arc(chx, chy, cell*0.36, 0, Math.PI*2); c.fill();
+          c.fillStyle='#c9a227';
+          for(let i=0;i<5;i++){ const ang=Math.random()*Math.PI*2, rr=cell*0.12; c.beginPath(); c.arc(chx+Math.cos(ang)*cell*0.16, chy+Math.sin(ang)*cell*0.16, rr, 0, Math.PI*2); c.fill(); }
+
+          // Snake/mouse
+          for (let i=0;i<this.snake.length;i++){
+            const s = this.snake[i]; const x = offX + s.x*cell, y = offY + s.y*cell;
+            const col = i===0? '#a5b4fc' : '#6b7fdc';
+            shadow(()=>{ c.fillStyle=col; roundRect(x+3, y+3, cell-6, cell-6, 8); c.fill(); }, 12, 'rgba(0,0,0,0.35)', 0, 6);
+            if (i===0){ // ears/eye
+              c.fillStyle='#eaf2ff'; c.beginPath(); c.arc(x+cell*0.30, y+cell*0.32, cell*0.08, 0, Math.PI*2); c.fill(); c.beginPath(); c.arc(x+cell*0.62, y+cell*0.32, cell*0.08, 0, Math.PI*2); c.fill();
+              c.fillStyle='#0b0f1a'; c.beginPath(); c.arc(x+cell*0.62, y+cell*0.52, cell*0.07, 0, Math.PI*2); c.fill();
+            }
+          }
+
+          // HUD
+          const score = this.wordsRun.length;
+          c.textAlign='right'; c.textBaseline='top'; c.font='700 18px ui-sans-serif, system-ui'; c.fillStyle='#a5b4fc'; c.fillText(`Cheese: ${score}`, App.w-40, 28);
+
+          // Word banner
+          if (this.wordsRun.length){
+            const cur = this.wordsRun[this.wordsRun.length-1];
+            const bannerW = Math.min(560, App.w-80), bannerH=64, bx=App.w/2-bannerW/2, by=App.h- bannerH - 28;
+            shadow(()=>{ c.fillStyle='rgba(255,255,255,0.08)'; roundRect(bx,by,bannerW,bannerH,16); c.fill(); }, 18, 'rgba(0,0,0,0.35)', 0, 8);
+            c.textAlign='center'; c.textBaseline='middle'; c.fillStyle='#eaf2ff'; c.font='800 24px ui-sans-serif, system-ui'; c.fillText(`${cur.de}  —  ${cur.en}`, App.w/2, by+bannerH/2);
+          }
+
+          if (this.paused){ this.drawOverlay('Paused — Press P to resume'); }
+          if (this.over){ this.drawOverlay('Game Over — Enter to restart • Esc for menu'); }
+        },
+        drawOverlay(text){ const c=ctx(); c.fillStyle='rgba(11,15,26,0.7)'; c.fillRect(0,0,App.w,App.h); c.textAlign='center'; c.textBaseline='middle'; c.fillStyle='#eaf2ff'; c.font='900 42px ui-sans-serif, system-ui'; c.fillText(text, App.w/2, App.h/2); },
+        update(dt){ if (this.paused||this.over) return; this.acc+=dt; while (this.acc>=this.stepMs){ this.step(); this.acc-=this.stepMs; } },
+        step(){
+          // advance direction
+          this.dir = this.nextDir;
+          const head = {x: this.snake[0].x + this.dir.x, y: this.snake[0].y + this.dir.y};
+          // collisions
+          if (head.x<0||head.y<0||head.x>=this.grid.cols||head.y>=this.grid.rows || this.snake.some(s=>s.x===head.x && s.y===head.y)){
+            this.over=true; return;
+          }
+          this.snake.unshift(head);
+          if (head.x===this.cheese.x && head.y===this.cheese.y){
+            // Ate cheese — speak a new word
+            const [de,en] = App.wordBank[Math.floor(Math.random()*App.wordBank.length)];
+            this.wordsRun.push({de,en}); inc('cheese'); addWordLearned(de); speakWord(de,en); this.placeCheese();
+          } else { this.snake.pop(); }
+        },
+        keydown(e){
+          if (e.key==='Escape'){ setState('menu'); return; }
+          if (e.key.toLowerCase()==='p'){ this.paused=!this.paused; return; }
+          if (e.key.toLowerCase()==='r'){ const last=this.wordsRun[this.wordsRun.length-1]; if (last) speakWord(last.de,last.en); return; }
+          if (this.over){ if (e.key==='Enter') setState('snake'); return; }
+          // no reverse
+          if (e.key==='ArrowUp' && this.dir.y!==1) this.nextDir={x:0,y:-1};
+          if (e.key==='ArrowDown' && this.dir.y!==-1) this.nextDir={x:0,y:1};
+          if (e.key==='ArrowLeft' && this.dir.x!==1) this.nextDir={x:-1,y:0};
+          if (e.key==='ArrowRight' && this.dir.x!==-1) this.nextDir={x:1,y:0};
+        }
+      }
+    };
+
+    // ========= State control =========
+    function setState(name, payload=null){ App.state = name; App.substate=null; App.buttons.length=0; if (Screens[name].enter) Screens[name].enter(payload); }
+
+    // ========= Init =========
+    function init(){
+      App.ctx = App.canvas.getContext('2d');
+      resize(); window.addEventListener('resize', resize);
+      App.canvas.addEventListener('mousemove', (e)=>{ const rect=App.canvas.getBoundingClientRect(); App.pointer.x = (e.clientX-rect.left); App.pointer.y = (e.clientY-rect.top); });
+      App.canvas.addEventListener('mousedown', ()=>{ App.pointer.down=true; });
+      window.addEventListener('mouseup', ()=>{ if (App.pointer.down){ App.pointer.down=false; App.pointer.justUp=true; } });
+      App.canvas.addEventListener('click', ()=>{ // dispatch to first hit button
+        for (const b of App.buttons){ if (!b.disabled && hit(b.x,b.y,b.w,b.h)){ b.onClick && b.onClick(); break; } }
+      });
+      window.addEventListener('keydown', (e)=>{ if (Screens[App.state] && Screens[App.state].keydown) Screens[App.state].keydown(e); });
+      window.addEventListener('blur', ()=>{ if (App.state==='snake') Screens.snake.paused=true; });
+
+      App.wordBank = WB; App.progress = loadProgress(); ensureDay(); saveProgress();
+      setState('menu');
+      requestAnimationFrame(loop);
+    }
+
+    function loop(ts){ App.now = ts; App.dt = ts - App.last; App.last = ts; App.buttons.length=0; // clear buttons each frame
+      if (Screens[App.state]){
+        if (Screens[App.state].update) Screens[App.state].update(App.dt);
+        Screens[App.state].draw();
+      } else { drawBackground(); const c = ctx(); c.fillStyle='#eaf2ff'; c.font='700 24px ui-sans-serif, system-ui'; c.fillText('Unknown state', 20, 20); }
+      App.pointer.justUp=false; requestAnimationFrame(loop);
+    }
+
+    // Start
+    init();
+  })();
+  </script>
+</body>
+</html>
